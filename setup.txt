@@ -1,0 +1,6 @@
+//cmd
+yarn init -2
+yarn add -D vite
+
+//yarn add three
+//yarn add Tweakpane

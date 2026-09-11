@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>WebXR AR 籃球遊戲</title>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: sans-serif; }
+        #debug-panel {
+            position: absolute; top: 10px; left: 10px; right: 10px;
+            background: rgba(0,0,0,0.8); color: #00ff00;
+            padding: 10px; font-size: 12px; border-radius: 5px;
+            max-height: 150px; overflow-y: auto; z-index: 999;
+        }
+        #ar-button {
+            position: absolute; bottom: 20px; left: 50%;
+            transform: translateX(-50%); padding: 12px 24px;
+            font-size: 16px; background: #28a745; color: white;
+            border: none; border-radius: 4px; display: none; z-index: 999;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="debug-panel">系統日誌：等待初始化...</div>
+    <button id="ar-button">進入 AR 投籃遊戲</button>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+    <script>
+        const debugPanel = document.getElementById('debug-panel');
+        const arButton = document.getElementById('ar-button');
+        
+        function log(msg) {
+            debugPanel.innerHTML += "<br>> " + msg;
+            debugPanel.scrollTop = debugPanel.scrollHeight;
+        }
+
+        let camera, scene, renderer;
+        let xrSession = null;
+        let balls = [];
+        const clock = new THREE.Clock();
+
+        // ==========================================
+        // 核心物理與環境常數設定
+        // ==========================================
+        const GRAVITY = 6.0;         // 重力加速度
+        const BOUNCE = 0.55;         // 反彈係數
+        const FLOOR_Y = -1.5;        // 地面高度 (相機下方 1.5 公尺)
+        const BALL_RADIUS = 0.06;    // 籃球半徑 6 公分
+
+        // 籃球架各組件的物理參數
+        let backboardBox = new THREE.Box3();
+        let hoopCenter = new THREE.Vector3(0, 0.5, -2.0); // 籃框中心點
+        const HOOP_RADIUS = 0.15;    // 籃框內圈半徑 15 公分
+        const HOOP_THICKNESS = 0.015; // 籃框管徑厚度
+
+        // 支撐柱的物理參數
+        const POLE_X = 0;
+        const POLE_Z = -2.25; 
+        const POLE_RADIUS = 0.04; 
+        const POLE_MIN_Y = FLOOR_Y; 
+        const POLE_MAX_Y = 0.75;    
+
+        // 1. 檢查 WebXR 支援
+        if ('xr' in navigator) {
+            navigator.xr.isSessionSupported('immersive-ar')
+                .then((supported) => {
+                    if (supported) {
+                        log("✅ 裝置支援 AR 模式");
+                        arButton.style.display = 'block';
+                    } else {
+                        log("❌ 裝置不支援 AR 模式");
+                    }
+                });
+        } else {
+            log("❌ 完全不支援 WebXR");
+        }
+
+        // 2. 啟動 AR 會話
+        arButton.addEventListener('click', () => {
+            if (xrSession === null) {
+                navigator.xr.requestSession('immersive-ar', {
+                    optionalFeatures: ['local-floor', 'bounded-floor']
+                })
+                .then(onSessionStarted)
+                .catch(err => log("無法啟動 AR: " + err.message));
+            }
+        });
+
+        function onSessionStarted(session) {
+            xrSession = session;
+            log("🏀 遊戲開始！點擊螢幕投籃，砸中籃框邊緣也會反彈喔！");
+            arButton.style.display = 'none';
+
+            initThree();
+
+            renderer.xr.setReferenceSpaceType('local');
+            renderer.xr.setSession(session);
+
+            session.addEventListener('select', spawnBall);
+
+            session.addEventListener('end', () => {
+                log("AR 會話已結束。");
+                xrSession = null;
+                arButton.style.display = 'block';
+            });
+        }
+
+        // 3. 初始化 Three.js 場景
+        function initThree() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+            // 光源
+            const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1.3);
+            scene.add(light);
+            const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            dirLight.position.set(5, 10, 5);
+            scene.add(dirLight);
+
+            // 地面
+            const floorGeo = new THREE.PlaneGeometry(10, 10);
+            const floorMat = new THREE.MeshPhongMaterial({ 
+                color: 0x224422, 
+                transparent: true, 
+                opacity: 0.4, 
+                side: THREE.DoubleSide 
+            });
+            const floor = new THREE.Mesh(floorGeo, floorMat);
+            floor.rotation.x = -Math.PI / 2;
+            floor.position.y = FLOOR_Y;
+            scene.add(floor);
+
+            // 建立籃球架模型組合
+            const basketballGoalGroup = new THREE.Group();
+
+            // A. 底座 (黃色)
+            const baseGeo = new THREE.BoxGeometry(0.6, 0.1, 0.6);
+            const baseMat = new THREE.MeshPhongMaterial({ color: 0xffcc00 });
+            const base = new THREE.Mesh(baseGeo, baseMat);
+            base.position.set(POLE_X, FLOOR_Y + 0.05, POLE_Z);
+            basketballGoalGroup.add(base);
+
+            // B. 支撐柱 (黑色)
+            const poleHeight = POLE_MAX_Y - POLE_MIN_Y;
+            const poleGeo = new THREE.CylinderGeometry(POLE_RADIUS, POLE_RADIUS, poleHeight, 16);
+            const poleMat = new THREE.MeshPhongMaterial({ color: 0x222222 });
+            const pole = new THREE.Mesh(poleGeo, poleMat);
+            pole.position.set(POLE_X, POLE_MIN_Y + poleHeight / 2, POLE_Z);
+            basketballGoalGroup.add(pole);
+
+            // C. 籃板 (白色)
+            const boardGeo = new THREE.BoxGeometry(0.8, 0.6, 0.02);
+            const boardMat = new THREE.MeshPhongMaterial({ color: 0xffffff, shininess: 60 });
+            const backboard = new THREE.Mesh(boardGeo, boardMat);
+            backboard.position.set(0, 0.75, -2.15); 
+            basketballGoalGroup.add(backboard);
+
+            // 設定籃板碰撞邊界
+            backboardBox.set(
+                new THREE.Vector3(-0.4, 0.45, -2.16),
+                new THREE.Vector3(0.4, 1.05, -2.14)
+            );
+
+            // D. 籃框 (紅色)
+            const hoopGeo = new THREE.TorusGeometry(HOOP_RADIUS, HOOP_THICKNESS, 16, 100);
+            const hoopMat = new THREE.MeshPhongMaterial({ color: 0xcc0000 });
+            const hoop = new THREE.Mesh(hoopGeo, hoopMat);
+            hoop.position.copy(hoopCenter);
+            hoop.rotation.x = Math.PI / 2;
+            basketballGoalGroup.add(hoop);
+
+            // E. 籃網 (白色網格)
+            const netGeo = new THREE.CylinderGeometry(HOOP_RADIUS, HOOP_RADIUS * 0.7, 0.3, 16, 1, true);
+            const netMat = new THREE.MeshPhongMaterial({ color: 0xeeeeee, wireframe: true, transparent: true, opacity: 0.4 });
+            const net = new THREE.Mesh(netGeo, netMat);
+            net.position.set(hoopCenter.x, hoopCenter.y - 0.15, hoopCenter.z);
+            basketballGoalGroup.add(net);
+
+            scene.add(basketballGoalGroup);
+
+            // 渲染器設定
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement);
+
+            clock.start();
+            renderer.setAnimationLoop(render);
+        }
+
+        // 4. 發射籃球
+        function spawnBall() {
+            const geometry = new THREE.SphereGeometry(BALL_RADIUS, 24, 24);
+            const material = new THREE.MeshStandardMaterial({ 
+                color: 0xd9531e, 
+                roughness: 0.6,
+                metalness: 0.1
+            });
+            const ballMesh = new THREE.Mesh(geometry, material);
+
+            const ballPosition = new THREE.Vector3();
+            const ballDirection = new THREE.Vector3();
+            camera.getWorldPosition(ballPosition);
+            camera.getWorldDirection(ballDirection);
+
+            ballMesh.position.copy(ballPosition).addScaledVector(ballDirection, 0.12);
+            scene.add(ballMesh);
+
+            const pushVelocity = ballDirection.clone();
+            pushVelocity.y += 0.22; 
+            pushVelocity.normalize();
+
+            const speed = 4.7; 
+            const velocity = pushVelocity.multiplyScalar(speed);
+
+            balls.push({
+                mesh: ballMesh,
+                velocity: velocity,
+                life: 0,
+                hasScored: false
+            });
+        }
+
+        // 5. 每幀物理與渲染更新
+        function render() {
+            const delta = Math.min(clock.getDelta(), 0.05); // 限制單影格步長，徹底杜絕物理穿牆導致卡死
+
+            for (let i = balls.length - 1; i >= 0; i--) {
+                const ball = balls[i];
+                
+                // 套用重力
+                ball.velocity.y -= GRAVITY * delta;
+
+                // 更新位置
+                ball.mesh.position.addScaledVector(ball.velocity, delta);
+                ball.life += delta;
+
+                // --- A. 地面碰撞 ---
+                if (ball.mesh.position.y - BALL_RADIUS <= FLOOR_Y) {
+                    ball.mesh.position.y = FLOOR_Y + BALL_RADIUS; 
+                    ball.velocity.y = -ball.velocity.y * BOUNCE;   
+                    ball.velocity.x *= 0.75;
+                    ball.velocity.z *= 0.75;
+                }
+
+                // --- B. 籃板碰撞 (防穿模卡頓版) ---
+                if (ball.velocity.z < 0 &&
+                    ball.mesh.position.z - BALL_RADIUS <= backboardBox.max.z && 
+                    ball.mesh.position.z + BALL_RADIUS >= backboardBox.min.z &&
+                    ball.mesh.position.x >= backboardBox.min.x && ball.mesh.position.x <= backboardBox.max.x &&
+                    ball.mesh.position.y >= backboardBox.min.y && ball.mesh.position.y <= backboardBox.max.y) {
+                    
+                    ball.mesh.position.z = backboardBox.max.z + BALL_RADIUS + 0.005; 
+                    ball.velocity.z = Math.abs(ball.velocity.z) * BOUNCE;
+                    ball.velocity.x *= 0.8;
+                    ball.velocity.y *= 0.8; 
+                }
+
+                // --- C. 柱子圓柱體碰撞 ---
+                if (ball.mesh.position.y >= POLE_MIN_Y && ball.mesh.position.y <= POLE_MAX_Y) {
+                    const dx = ball.mesh.position.x - POLE_X;
+                    const dz = ball.mesh.position.z - POLE_Z;
+                    const distanceXZ = Math.sqrt(dx * dx + dz * dz);
+                    const minDistance = POLE_RADIUS + BALL_RADIUS;
+
+                    if (distanceXZ < minDistance) {
+                        const nx = dx / distanceXZ;
+                        const nz = dz / distanceXZ;
+                        ball.mesh.position.x = POLE_X + nx * (minDistance + 0.005);
+                        ball.mesh.position.z = POLE_Z + nz * (minDistance + 0.005);
+
+                        const dotProduct = ball.velocity.x * nx + ball.velocity.z * nz;
+                        if (dotProduct < 0) {
+                            ball.velocity.x = (ball.velocity.x - 2 * dotProduct * nx) * BOUNCE;
+                            ball.velocity.z = (ball.velocity.z - 2 * dotProduct * nz) * BOUNCE;
+                            ball.velocity.y *= 0.8;
+                            log("💥 砸到球架柱子！");
+                        }
+                    }
+                }
+
+                // --- D. 【新增：籃框紅圈硬碰撞偵測】 ---
+                // 計算球心到籃框中心點的水平二維距離
+                const dxHoop = ball.mesh.position.x - hoopCenter.x;
+                const dzHoop = ball.mesh.position.z - hoopCenter.z;
+                const distToCenter = Math.sqrt(dxHoop * dxHoop + dzHoop * dzHoop);
+
+                // 如果球的高度接近籃框高度 (考慮到球的半徑與鐵圈厚度)
+                if (Math.abs(ball.mesh.position.y - hoopCenter.y) < (BALL_RADIUS + HOOP_THICKNESS)) {
+                    // 計算球心距離紅色金屬鐵圈中心線的距離
+                    const distToRingTube = Math.abs(distToCenter - HOOP_RADIUS);
+                    const collisionLimit = BALL_RADIUS + HOOP_THICKNESS;
+
+                    if (distToRingTube < collisionLimit) {
+                        // 計算從鐵圈指向球心的三維反彈方向向量
+                        // 鐵圈上的最近點座標
+                        const angle = Math.atan2(dzHoop, dxHoop);
+                        const closestRingX = hoopCenter.x + Math.cos(angle) * HOOP_RADIUS;
+                        const closestRingZ = hoopCenter.z + Math.sin(angle) * HOOP_RADIUS;
+
+                        const normalX = ball.mesh.position.x - closestRingX;
+                        const normalY = ball.mesh.position.y - hoopCenter.y;
+                        const normalZ = ball.mesh.position.z - closestRingZ;
+                        const normalLen = Math.sqrt(normalX*normalX + normalY*normalY + normalZ*normalZ);
+
+                        if (normalLen > 0) {
+                            // 法向量歸一化
+                            const nx = normalX / normalLen;
+                            const ny = normalY / normalLen;
+                            const nz = normalZ / normalLen;
+
+                            // 修正穿模位置，往外推移
+                            ball.mesh.position.x = closestRingX + nx * (collisionLimit + 0.005);
+                            ball.mesh.position.y = hoopCenter.y + ny * (collisionLimit + 0.005);
+                            ball.mesh.position.z = closestRingZ + nz * (collisionLimit + 0.005);
+
+                            // 速度向量反射
+                            const dotProd = ball.velocity.x * nx + ball.velocity.y * ny + ball.velocity.z * nz;
+                            if (dotProd < 0) {
+                                ball.velocity.x = (ball.velocity.x - 2 * dotProd * nx) * BOUNCE;
+                                ball.velocity.y = (ball.velocity.y - 2 * dotProd * ny) * BOUNCE;
+                                ball.velocity.z = (ball.velocity.z - 2 * dotProd * nz) * BOUNCE;
+                                log("🔔 彈框！差一點就進了！");
+                            }
+                        }
+                    }
+                }
+
+                // --- E. 籃框進球得分偵測 (防卡死鎖死版) ---
+                if (!ball.hasScored) {
+                    const horizontalDist = Math.sqrt(
+                        Math.pow(ball.mesh.position.x - hoopCenter.x, 2) + 
+                        Math.pow(ball.mesh.position.z - hoopCenter.z, 2)
+                    );
+                    
+                    // 水平範圍在籃框內(不含鐵圈邊緣)，且這一幀的高度剛好「由上往下」穿越籃框平面
+                    if (horizontalDist < (HOOP_RADIUS - HOOP_THICKNESS)) {
+                        const prevY = ball.mesh.position.y - ball.velocity.y * delta;
+                        if (prevY >= hoopCenter.y && ball.mesh.position.y <= hoopCenter.y) {
+                            ball.hasScored = true;
+                            ball.mesh.material.color.setHex(0x00ff00); // 進球變綠色
+                            
+                            // 進球後給予一個微幅向下的固定速度，模擬刷網穿過，防止在邊界線顫抖
+                            ball.velocity.y = -1.5; 
+                            ball.velocity.x *= 0.5;
+                            ball.velocity.z *= 0.5;
+                            
+                            log("🏀 進球得分！！！太準了吧！");
+                        }
+                    }
+                }
+
+                // --- F. 自動生命週期回收 ---
+                if (ball.life > 6 || Math.abs(ball.mesh.position.x) > 6 || Math.abs(ball.mesh.position.z) > 8) {
+                    scene.remove(ball.mesh);
+                    ball.mesh.geometry.dispose();
+                    ball.mesh.material.dispose();
+                    balls.splice(i, 1);
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,187 @@
+ <!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three.js Example</title>
+    
+  <script type="module" crossorigin src="./assets/main-CjMq6C-U.js"></script>
+  <link rel="modulepreload" crossorigin href="./assets/chunk-C2fboVbj.js">
+  <link rel="modulepreload" crossorigin href="./assets/three.webgpu-MUu7-oad.js">
+  <link rel="stylesheet" crossorigin href="./assets/main-Bhy39c2_.css">
+</head>
+<body>
+    
+    
+   <div id="menu-ui">
+      <div class="menu-content">
+          <p>WebGPU + Rapier 3D 物理實驗</p>
+          <div class="button-group">
+            <button id="start-button" class="menu-btn">籃球遊戲</button>
+            <button id="start2-button" class="menu-btn">足球遊戲</button>
+            <button id="test-button" class="menu-btn">物理測試</button>
+            <button id="test2-button" class="menu-btn">AR測試</button>
+          </div>
+          <div class="controls-hint">
+              <span>WASD 移動</span> | <span>滑鼠 抓取/投擲</span> | <span>空白鍵 跳躍</span> | <span> E 鍵 踢球</span> | <span> Q 鍵 視角切換</span><br>
+              <span>R 鍵 重製球體</span> |<span>/ 鍵 修改光線</span>
+          </div>
+      </div>
+    </div>
+
+    <div id="loading-screen">
+        <div class="loader"></div>
+        <p>正在初始化物理世界...</p>
+    </div>
+    <div id="crosshair"></div>
+    
+        <div id="joystick-move"></div>
+        <div id="joystick-look"></div>
+    
+    <div id="fps-counter">FPS: 0</div>
+    <div id="point-counter">Point: 0</div>
+
+    <button id="return-button" class="menu-btn return-style">返回選單</button>
+    <canvas class="threejs-canvas" id="canvas" style="  z-index: 2;"></canvas> 
+    
+    <div id="ar-overlay" style="display: none; position: absolute; z-index: 1; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;">
+    <div id="debug-panel" style="pointer-events: auto;"></div>
+    </div>
+    
+    
+</body>
+</html>
+
+
+<!--DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>WebXR AR 座標軸測試</title>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: sans-serif; }
+        #debug-panel {
+            position: absolute; top: 10px; left: 10px; right: 10px;
+            background: rgba(0,0,0,0.8); color: #00ff00;
+            padding: 10px; font-size: 12px; border-radius: 5px;
+            max-height: 150px; overflow-y: auto; z-index: 999;
+        }
+        #ar-button {
+            position: absolute; bottom: 20px; left: 50%;
+            transform: translateX(-50%); padding: 12px 24px;
+            font-size: 16px; background: #28a745; color: white;
+            border: none; border-radius: 4px; display: none; z-index: 999;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="debug-panel">系統日誌：等待初始化...</div>
+    <button id="ar-button">進入 AR 軸向測試</button>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+    <script>
+        const debugPanel = document.getElementById('debug-panel');
+        const arButton = document.getElementById('ar-button');
+        
+        function log(msg) {
+            debugPanel.innerHTML += "<br>> " + msg;
+            debugPanel.scrollTop = debugPanel.scrollHeight;
+        }
+
+        let camera, scene, renderer;
+        let xrSession = null;
+
+        // 1. 檢查 WebXR 支援狀態
+        if ('xr' in navigator) {
+            navigator.xr.isSessionSupported('immersive-ar')
+                .then((supported) => {
+                    if (supported) {
+                        log("✅ 裝置支援 AR 模式");
+                        arButton.style.display = 'block';
+                    } else {
+                        log("❌ 瀏覽器支援 WebXR，但回報「不支援 AR 模式」");
+                    }
+                });
+        } else {
+            log("❌ 完全不支援 WebXR");
+        }
+
+        // 2. 點擊按鈕啟動 AR
+        arButton.addEventListener('click', () => {
+            if (xrSession === null) {
+                navigator.xr.requestSession('immersive-ar', {
+                    optionalFeatures: ['local-floor', 'bounded-floor']
+                })
+                .then(onSessionStarted)
+                .catch(err => log("無法啟動 AR: " + err.message));
+            }
+        });
+
+        function onSessionStarted(session) {
+            xrSession = session;
+            log("🎉 AR 會話啟動成功！");
+            arButton.style.display = 'none';
+
+            initThree();
+
+            renderer.xr.setReferenceSpaceType('local');
+            renderer.xr.setSession(session);
+
+            session.addEventListener('end', () => {
+                log("AR 會話已結束。");
+                xrSession = null;
+                arButton.style.display = 'block';
+            });
+        }
+
+// 初始化 Three.js 環境
+        function initThree() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+            // 加點光線讓方塊有立體感
+            const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+            scene.add(light);
+            
+            // 1. 建立一個群組 (Group)，用來把方塊和座標軸綁在一起
+            const arGroup = new THREE.Group();
+
+            // 2. 建立方塊（改為半透明，方便看裡面的軸）
+            const geometry = new THREE.BoxGeometry(0.1, 0.1, 0.1); // 20公分方塊
+            const material = new THREE.MeshNormalMaterial({
+                transparent: true,
+                opacity: 0.6 // 60% 透明度
+            });
+            const mesh = new THREE.Mesh(geometry, material);
+            arGroup.add(mesh); // 加進群組
+
+            // 3. 建立座標軸 (AxesHelper)
+            // 參數 0.3 代表軸長 30 公分，會比 20 公分的方塊稍微突出一點
+            const axesHelper = new THREE.AxesHelper(0.3);
+            arGroup.add(axesHelper); // 加進群組
+
+            // 4. 把整個群組放到相機前方 50 公分處
+            arGroup.position.set(0, 0, -0.5);
+            scene.add(arGroup);
+
+            // 建立渲染器
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            
+            document.body.appendChild(renderer.domElement);
+
+            renderer.setAnimationLoop(render);
+        }
+
+        // 純渲染，不執行旋轉
+        function render() {
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+</html-->

@@ -1,0 +1,17 @@
+    // 呼叫我們重構好的 FBX 建立函式
+    createFBXBall(
+        scene, 
+        world, 
+        {
+            type: 'football',
+            modelPath: 'texture/football.fbx', // 你的 FBX 檔案路徑
+            position: { x: 0, y: 10, z: 0 },
+
+        },
+        // 🌟 這是第 4 個參數 (onComplete 回呼函式)
+        (meshContainer) => {
+            // 當 FBX 真正加進場景並對齊原點後，才會執行這裡，100% 安全
+            pickableObjects.push(meshContainer); 
+            console.log("🏀 FBX 籃球已成功安全加入 pickable 陣列！");
+        }
+    );

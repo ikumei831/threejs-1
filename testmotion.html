@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MediaPipe 終極運動動態偵測</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #000;
+            font-family: Arial, sans-serif;
+        }
+        .container {
+            position: relative;
+            width: 100%;
+            height: 100%;
+        }
+        video {
+            display: none;
+        }
+        canvas {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            transform: scaleX(-1);
+        }
+        #loading {
+            position: absolute;
+            color: white;
+            font-size: 24px;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 10;
+            background: rgba(0,0,0,0.7);
+            padding: 20px;
+            border-radius: 10px;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <div id="loading">AI 模型載入中，請稍候...</div>
+        <video id="webcam" autoplay playsinline></video>
+        <canvas id="output_canvas"></canvas>
+    </div>
+
+    <script type="module">
+        import { HandLandmarker, PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/vision_bundle.mjs";
+
+        const video = document.getElementById("webcam");
+        const canvas = document.getElementById("output_canvas");
+        const ctx = canvas.getContext("2d");
+        const loadingDiv = document.getElementById("loading");
+
+        let poseLandmarker;
+        let handLandmarker;
+        let lastVideoTime = -1;
+
+        // 【跑步判定變數組】
+        let lastY = 0;              
+        let currentDirection = 0;  
+        let directionChanges = 0;  
+        let lastChangeTime = 0;    
+        let lastRunningTrueTime = 0; 
+
+        // ─── 【人物朝向與左手平移控制變數】 ───
+        let playerFacing = {
+            yaw: 0,     // 左右朝向角度
+            pitch: 0    // 上下朝向角度
+        };
+        
+        let leftHandOpenStartTime = 0; 
+        let isControlActive = false;    
+        let leftHandAnchor = null; // 基準點
+
+        // 【新增：防止遮擋中斷的緩衝計時器】
+        let leftHandLostTime = 0; // 紀錄左手遺失或閉合的起始時間
+        const GRACE_PERIOD_MS = 300; // 遮擋緩衝時間：300毫秒內重現可無縫繼續
+
+        async function initMediaPipe() {
+            const vision = await FilesetResolver.forVisionTasks(
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm"
+            );
+
+            try {
+                poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+                    baseOptions: {
+                        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task",
+                        delegate: "GPU"
+                    },
+                    runningMode: "VIDEO"
+                });
+
+                handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                    baseOptions: {
+                        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
+                        delegate: "GPU"
+                    },
+                    runningMode: "VIDEO",
+                    numHands: 2
+                });
+
+                loadingDiv.style.display = "none";
+                startCamera();
+
+            } catch (error) {
+                console.error("模型下載失敗:", error);
+                loadingDiv.innerText = "模型載入失敗，請檢查主機連線。";
+            }
+        }
+
+        function startCamera() {
+            navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 } } })
+                .then((stream) => {
+                    video.srcObject = stream;
+                    video.addEventListener("loadeddata", predictLoop);
+                });
+        }
+
+        function getDistance3D(p1, p2) {
+            return Math.sqrt(
+                Math.pow(p1.x - p2.x, 2) +
+                Math.pow(p1.y - p2.y, 2) +
+                Math.pow(p1.z - p2.z, 2)
+            );
+        }
+
+        function calculateAngle(pA, pB, pC) {
+            const AB = Math.hypot(pB.x - pA.x, pB.y - pA.y);
+            const BC = Math.hypot(pC.x - pB.x, pC.y - pB.y);
+            const AC = Math.hypot(pC.x - pA.x, pC.y - pA.y);
+            
+            const cosine = (Math.pow(AB, 2) + Math.pow(BC, 2) - Math.pow(AC, 2)) / (2 * AB * BC);
+            let angle = Math.acos(Math.max(-1, Math.min(1, cosine))) * (180 / Math.PI);
+            return angle;
+        }
+
+        async function predictLoop() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            const videoWidth = video.videoWidth;
+            const videoHeight = video.videoHeight;
+            
+            const scale = Math.max(canvas.width / videoWidth, canvas.height / videoHeight);
+            const xOffset = (canvas.width - videoWidth * scale) / 2;
+            const yOffset = (canvas.height - videoHeight * scale) / 2;
+
+            ctx.drawImage(video, xOffset, yOffset, videoWidth * scale, videoHeight * scale);
+
+            function getCanvasCoords(landmark) {
+                return {
+                    x: landmark.x * (videoWidth * scale) + xOffset,
+                    y: landmark.y * (videoHeight * scale) + yOffset
+                };
+            }
+
+            let startTimeMs = performance.now();
+
+            if (lastVideoTime !== video.currentTime && video.currentTime > 0) {
+                lastVideoTime = video.currentTime;
+
+                const poseResults = poseLandmarker.detectForVideo(video, startTimeMs);
+                const handResults = handLandmarker.detectForVideo(video, startTimeMs);
+
+                let isShoulderOffCenter = false;
+                let isCurrentlyTriggered = false; 
+                let isRunning = false;             
+
+                // --- 姿態與跑步演算法 ---
+                if (poseResults.landmarks && poseResults.landmarks.length > 0) {
+                    const pose = poseResults.landmarks[0];
+                    const upperBodyIndices = [11, 12, 13, 14, 15, 16];
+                    
+                    upperBodyIndices.forEach(index => {
+                        const landmark = pose[index];
+                        if(landmark) {
+                            const coords = getCanvasCoords(landmark);
+                            drawCircle(coords.x, coords.y, 7, "#ff3366");
+                        }
+                    });
+                    
+                    if (pose[11] && pose[12]) {
+                        const p11 = getCanvasCoords(pose[11]); 
+                        const p12 = getCanvasCoords(pose[12]); 
+                        const p13 = getCanvasCoords(pose[13]); 
+                        const p14 = getCanvasCoords(pose[14]); 
+                        const p15 = getCanvasCoords(pose[15]); 
+                        const p16 = getCanvasCoords(pose[16]); 
+
+                        drawLine(p11, p12, "#ff3366", 3);
+                        drawLine(p11, p13, "#ff3366", 3);
+                        drawLine(p13, p15, "#ff3366", 3);
+                        drawLine(pose[12] ? p12 : null, p14, "#ff3366", 3);
+                        drawLine(p14, p16, "#ff3366", 3);
+
+                        const shoulderCenterX = (pose[11].x + pose[12].x) / 2;
+                        if (Math.abs(shoulderCenterX - 0.5) > 0.12) {
+                            isShoulderOffCenter = true;
+                        }
+
+                        if (pose[15] && pose[13]) {
+                            const curY = p15.y;
+                            const shoulderY = p11.y;
+
+                            const isHeightValid = curY >= (shoulderY - 50);
+                            const armAngle = calculateAngle(p11, p13, p15);
+                            const isAngleValid = armAngle <= 150;
+
+                            if (isHeightValid && isAngleValid && lastY !== 0) {
+                                const diffY = curY - lastY;
+                                
+                                let newDir = 0;
+                                if (diffY > 2) newDir = 1;       
+                                else if (diffY < -2) newDir = -1; 
+
+                                if (newDir !== 0 && newDir !== currentDirection) {
+                                    if (startTimeMs - lastChangeTime > 100) {
+                                        directionChanges++;
+                                        currentDirection = newDir;
+                                        lastChangeTime = startTimeMs;
+                                    }
+                                }
+
+                                if (directionChanges >= 2) {
+                                    isCurrentlyTriggered = true;
+                                    lastRunningTrueTime = startTimeMs; 
+                                }
+                            } else {
+                                directionChanges = 0;
+                            }
+
+                            if (startTimeMs - lastChangeTime > 200) {
+                                directionChanges = 0;
+                            }
+
+                            lastY = curY;
+                        }
+                    }
+                }
+
+                if (isCurrentlyTriggered || (startTimeMs - lastRunningTrueTime < 500 && lastRunningTrueTime !== 0)) {
+                    isRunning = true;
+                }
+
+                // --- 手指偵測與控制核心 ---
+                let hasLeftHandThisFrame = false; 
+
+                if (handResults.landmarks && handResults.landmarks.length > 0) {
+                    let isAnyHandTooClose = false;
+
+                    for (let i = 0; i < handResults.landmarks.length; i++) {
+                        const hand = handResults.landmarks[i];
+                        const handedness = handResults.handednesses[i][0].categoryName; 
+                        const handLabel = (handedness === "Left") ? "左手" : "右手";
+
+                        hand.forEach(landmark => {
+                            const coords = getCanvasCoords(landmark);
+                            drawCircle(coords.x, coords.y, 5, "#00ccff");
+                        });
+
+                        const wrist = hand[0];
+                        const indexKnuckle = hand[5];
+                        const palmSize2D = Math.hypot(wrist.x - indexKnuckle.x, wrist.y - indexKnuckle.y);
+                        
+                        if (palmSize2D > 0.23) {
+                            isAnyHandTooClose = true;
+                        }
+
+                        const distIndex  = getDistance3D(hand[8],  wrist);
+                        const distMiddle = getDistance3D(hand[12], wrist);
+                        const distRing   = getDistance3D(hand[16], wrist);
+                        const distPinky  = getDistance3D(hand[20], wrist);
+
+                        // ─── 【左手控制移動與朝向演算法】 ───
+                        if (handLabel === "左手") {
+                            hasLeftHandThisFrame = true;
+
+                            // 1. 判斷左手是否「張開」
+                            const isOpenIndex  = distIndex  > getDistance3D(hand[5],  wrist) * 1.15;
+                            const isOpenMiddle = distMiddle > getDistance3D(hand[9],  wrist) * 1.15;
+                            const isOpenRing   = distRing   > getDistance3D(hand[13], wrist) * 1.15;
+                            const isOpenPinky  = distPinky  > getDistance3D(hand[17], wrist) * 1.15;
+                            const isHandOpen   = isOpenIndex && isOpenMiddle && isOpenRing && isOpenPinky;
+
+                            if (isHandOpen) {
+                                // 重新抓到張開的手，重置遺失計時器
+                                leftHandLostTime = 0;
+
+                                if (leftHandOpenStartTime === 0) {
+                                    leftHandOpenStartTime = startTimeMs;
+                                } else if (startTimeMs - leftHandOpenStartTime > 500) { 
+                                    if (!isControlActive) {
+                                        isControlActive = true;
+                                        leftHandAnchor = { x: wrist.x, y: wrist.y, z: wrist.z };
+                                    }
+                                }
+                            } else {
+                                // 手指閉合（主動放開），開始計算遺失緩衝時間，不立刻銷毀
+                                if (leftHandLostTime === 0) {
+                                    leftHandLostTime = startTimeMs;
+                                }
+                            }
+
+                            // 2. 當控制已激活，且還在遮擋緩衝時間內時，進行旋轉計算
+                            if (isControlActive && leftHandAnchor && leftHandLostTime === 0) {
+                                const deltaX = wrist.x - leftHandAnchor.x;
+                                const deltaY = wrist.y - leftHandAnchor.y;
+
+                                // 計算手掌面法向量
+                                const vA = { x: hand[5].x - hand[0].x, y: hand[5].y - hand[0].y, z: hand[5].z - hand[0].z };
+                                const vB = { x: hand[17].x - hand[5].x, y: hand[17].y - hand[5].y, z: hand[17].z - hand[5].z };
+                                const normal = {
+                                    x: vA.y * vB.z - vA.z * vB.y,
+                                    y: vA.z * vB.x - vA.x * vB.z,
+                                    z: vA.x * vB.y - vA.y * vB.x
+                                };
+                                const len = Math.sqrt(normal.x * normal.x + normal.y * normal.y + normal.z * normal.z);
+                                if (len > 0) { normal.x /= len; normal.y /= len; normal.z /= len; }
+
+                                // 視覺化：畫出基準點與連線
+                                const anchorCanvas = getCanvasCoords(leftHandAnchor);
+                                const currentCanvas = getCanvasCoords(wrist);
+                                drawCircle(anchorCanvas.x, anchorCanvas.y, 8, "#ffff00"); 
+                                drawLine(anchorCanvas, currentCanvas, "#ffff00", 2);
+
+                                const deadzone = 0.035; 
+                                const sensitivity = 22.0; 
+
+                                if (Math.abs(normal.x) > Math.abs(normal.y)) {
+                                    if (Math.abs(deltaX) > deadzone) {
+                                        const sign = Math.sign(deltaX);
+                                        const controlledDeltaX = deltaX - (sign * deadzone);
+                                        playerFacing.yaw -= controlledDeltaX * sensitivity; 
+                                    }
+                                } else {
+                                    if (Math.abs(deltaY) > deadzone) {
+                                        const sign = Math.sign(deltaY);
+                                        const controlledDeltaY = deltaY - (sign * deadzone);
+                                        playerFacing.pitch += controlledDeltaY * sensitivity;
+                                    }
+                                }
+                                playerFacing.pitch = Math.max(-85, Math.min(85, playerFacing.pitch));
+                            }
+                        }
+                    }
+
+                    if (isAnyHandTooClose) {
+                        showCenterWarning("⚠️ 太近了！請把手後退", canvas.height / 2 - 60, "#ff0000");
+                    }
+                }
+
+                // ─── 【遮擋或遺失的邏輯處理核心】 ───
+                // 當前影格沒有左手，或是左手手指閉合時
+                if (!hasLeftHandThisFrame && isControlActive) {
+                    if (leftHandLostTime === 0) {
+                        leftHandLostTime = startTimeMs; // 開始計算遮擋時間
+                    }
+                }
+
+                // 檢查是否超過遮擋緩衝的臨界點 (300ms)
+                if (leftHandLostTime > 0 && (startTimeMs - leftHandLostTime > GRACE_PERIOD_MS)) {
+                    // 超過緩衝時間，確認是真的中斷或離開，此時正式清空數據
+                    leftHandOpenStartTime = 0;
+                    isControlActive = false;
+                    leftHandAnchor = null;
+                    leftHandLostTime = 0;
+                }
+
+                if (isShoulderOffCenter) {
+                    showCenterWarning("⚠️ 請坐回畫面中央", canvas.height / 2 + 60, "#ffcc00");
+                }
+
+                if (isRunning) {
+                    showCenterWarning("🏃 奔跑中...", canvas.height / 2, "#00ff00");
+                }
+
+                // ─── 【渲染面板與狀態提示】 ───
+                ctx.save();
+                ctx.translate(canvas.width, 0);
+                ctx.scale(-1, 1);
+                
+                if (leftHandOpenStartTime > 0 && !isControlActive) {
+                    const progress = Math.round((startTimeMs - leftHandOpenStartTime));
+                    ctx.fillStyle = "#ffff00";
+                    ctx.font = "20px Arial";
+                    ctx.fillText(`左手張開中... (${progress}/500ms)`, 20, canvas.height - 80);
+                } else if (isControlActive) {
+                    if (leftHandLostTime > 0) {
+                        // 正在被遮擋的過渡期提示
+                        const remaining = Math.round(GRACE_PERIOD_MS - (startTimeMs - leftHandLostTime));
+                        ctx.fillStyle = "#ff5500";
+                        ctx.font = "bold 20px Arial";
+                        ctx.fillText(`⚠️ 偵測遭遮擋... 保持原點中 (${remaining}ms)`, 20, canvas.height - 80);
+                    } else {
+                        ctx.fillStyle = "#00ffff";
+                        ctx.font = "bold 20px Arial";
+                        ctx.fillText("左手平移控制中：已激活 🎮", 20, canvas.height - 80);
+                    }
+                }
+
+                ctx.fillStyle = "#ffffff";
+                ctx.font = "bold 22px Arial";
+                ctx.fillText(`Player Facing -> 左右(Yaw): ${Math.round(playerFacing.yaw)}° | 上下(Pitch): ${Math.round(playerFacing.pitch)}°`, 20, canvas.height - 40);
+                ctx.restore();
+            }
+            requestAnimationFrame(predictLoop);
+        }
+
+        function showCenterWarning(text, yPosition, color) {
+            ctx.save();
+            ctx.translate(canvas.width, 0);
+            ctx.scale(-1, 1);
+            ctx.fillStyle = color;
+            ctx.font = "bold 32px Arial";
+            ctx.textAlign = "center";
+            ctx.shadowColor = "black";
+            ctx.shadowBlur = 8;
+            ctx.fillText(text, canvas.width / 2, yPosition);
+            ctx.restore();
+        }
+
+        function drawCircle(x, y, radius, color) {
+            ctx.beginPath();
+            ctx.arc(x, y, radius, 0, 2 * Math.PI);
+            ctx.fillStyle = color;
+            ctx.fill();
+        }
+
+        function drawLine(pt1, pt2, color, thickness) {
+            if (!pt1 || !pt2) return;
+            ctx.beginPath();
+            ctx.moveTo(pt1.x, pt1.y);
+            ctx.lineTo(pt2.x, pt2.y);
+            ctx.strokeStyle = color;
+            ctx.lineWidth = thickness;
+            ctx.stroke();
+        }
+
+        initMediaPipe();
+    </script>
+</body>
+</html>

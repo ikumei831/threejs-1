@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <title>純 WebGPU + WebXR AR 疊加渲染</title>
+    <style>
+        body { margin: 0; background: #000; color: #fff; font-family: sans-serif; overflow: hidden; }
+        #ar-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 999; display: none; }
+        #debug-panel { 
+            position: absolute; top: 10px; left: 10px; 
+            background: rgba(0,0,0,0.85); padding: 15px; 
+            pointer-events: auto; font-family: monospace; 
+            border-radius: 8px; line-height: 1.5;
+        }
+        #ar-button { position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%); padding: 15px 25px; z-index: 1000; cursor: pointer; }
+        #canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+    </style>
+</head>
+<body>
+
+    <button id="ar-button">啟動純 WebGPU AR 渲染</button>
+    <div id="ar-overlay">
+        <div id="debug-panel">初始化中...</div>
+        <canvas id="canvas"></canvas>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three/webgpu';
+
+        let xrSession = null;
+        let gpuDevice = null;
+        let xrGpuBinding = null;
+        let renderer, scene, camera, mesh;
+        const canvas = document.getElementById('canvas');
+
+        // 1. 初始化 WebGPU
+        async function initWebGPU() {
+            if (!navigator.gpu) {
+                document.getElementById('debug-panel').innerText = "❌ 您的瀏覽器完全不支援 WebGPU";
+                return false;
+            }
+            const adapter = await navigator.gpu.requestAdapter({ xrCompatible: true });
+            gpuDevice = await adapter.requestDevice();
+            return true;
+        }
+
+        // 2. 初始化 Three.js WebGPU 渲染環境
+        async function initThreeWebGPU() {
+            scene = new THREE.Scene();
+            
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+            camera.matrixAutoUpdate = false; // 由 WebXR 矩陣手動覆寫
+
+            // 這裡「只」使用原生 WebGPU 渲染器，不帶任何 WebGL 參數與後端
+            renderer = new THREE.WebGPURenderer({ 
+                canvas: canvas, 
+                antialias: true, 
+                alpha: true 
+            });
+            
+            // 務必非同步等待 WebGPU 核心初始化完成
+            await renderer.init();
+            
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+
+            // 加入光源
+            const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+            light.position.set(0.5, 1, 0.25);
+            scene.add(light);
+
+            // 加入 3D 物件與座標軸
+            const arGroup = new THREE.Group();
+            const geometry = new THREE.BoxGeometry(0.1, 0.1, 0.1);
+            const material = new THREE.MeshStandardMaterial({ color: 0x00ff00, transparent: true, opacity: 0.8 });
+            mesh = new THREE.Mesh(geometry, material);
+            arGroup.add(mesh);
+
+            const axesHelper = new THREE.AxesHelper(0.2);
+            arGroup.add(axesHelper);
+
+            arGroup.position.set(0, 0, -0.5); 
+            scene.add(arGroup);
+        }
+
+        // 3. 按鈕事件
+        document.getElementById('ar-button').addEventListener('click', async () => {
+            const gpuReady = await initWebGPU();
+            if (!gpuReady) return;
+
+            await initThreeWebGPU();
+
+            // 請求 WebXR 會話，強烈要求 WebGPU 支援
+            xrSession = await navigator.xr.requestSession('immersive-ar', {
+                requiredFeatures: ['dom-overlay', 'webgpu'],
+                domOverlay: { root: document.getElementById('ar-overlay') }
+            });
+
+            // 建立 WebXR 的 WebGPU 綁定
+            xrGpuBinding = new XRGPUBinding(xrSession, gpuDevice);
+            const projectionLayer = xrGpuBinding.createProjectionLayer({
+                colorFormat: xrGpuBinding.getPreferredColorFormat()
+            });
+            xrSession.updateRenderState({ layers: [projectionLayer] });
+
+            const refSpace = await xrSession.requestReferenceSpace('local');
+            
+            // 進入原生渲染迴圈
+            xrSession.requestAnimationFrame((time, frame) => onXRFrame(time, frame, projectionLayer, refSpace));
+
+            document.getElementById('ar-button').style.display = 'none';
+            document.getElementById('ar-overlay').style.display = 'block';
+        });
+
+        // 4. 純 WebGPU 核心驅動的 XR 幀循環
+        function onXRFrame(time, frame, layer, refSpace) {
+            const session = frame.session;
+            session.requestAnimationFrame((t, f) => onXRFrame(t, f, layer, refSpace));
+
+            const pose = frame.getViewerPose(refSpace);
+            if (pose) {
+                // UI 偵錯數據更新
+
+
+                // 同步相機空間矩陣
+                for (const view of pose.views) {
+                    camera.projectionMatrix.fromArray(view.projectionMatrix);
+                    camera.matrixWorld.fromArray(view.transform.matrix);
+                    camera.matrixWorldInverse.copy(camera.matrixWorld).invert();
+                }
+
+                // 【純 WebGPU 塗層渲染】直接利用 Canvas 與 WebGPU 核心作畫
+                renderer.render(scene, camera);
+            }
+        }
+
+        window.addEventListener('resize', () => {
+            if (camera && renderer) {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            }
+        });
+    </script>
+</body>
+</html>

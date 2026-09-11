@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <title>純 WebGPU + WebXR AR 疊加渲染</title>
+    <style>
+        body { margin: 0; background: #000; color: #fff; font-family: sans-serif; overflow: hidden; }
+        #ar-overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 999; display: none; }
+        #debug-panel { 
+            position: absolute; top: 10px; left: 10px; 
+            background: rgba(0,0,0,0.85); padding: 15px; 
+            pointer-events: auto; font-family: monospace; 
+            border-radius: 8px; line-height: 1.5;
+        }
+        #ar-button { position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%); padding: 15px 25px; z-index: 1000; cursor: pointer; }
+        #canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+    </style>
+  <script type="module" crossorigin src="./assets/testxr3-DBVV-xpJ.js"></script>
+  <link rel="modulepreload" crossorigin href="./assets/chunk-C2fboVbj.js">
+  <link rel="modulepreload" crossorigin href="./assets/three.webgpu-MUu7-oad.js">
+</head>
+<body>
+
+    <button id="ar-button">啟動純 WebGPU AR 渲染</button>
+    <div id="ar-overlay">
+        <div id="debug-panel">初始化中...</div>
+        <canvas id="canvas"></canvas>
+    </div>
+
+</body>
+</html>

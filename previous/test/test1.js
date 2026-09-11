@@ -1,0 +1,52 @@
+import * as THREE from 'three/webgpu';
+import { pass } from 'three/tsl';
+import { dotScreen } from 'three/addons/tsl/display/DotScreenNode.js';
+import { rgbShift } from 'three/addons/tsl/display/RGBShiftNode.js';
+
+// 1. 先初始化 Renderer
+const canvas = document.querySelector( 'canvas.threejs-canvas' );
+const renderer = new THREE.WebGPURenderer( { 
+    antialias: true,
+    canvas:canvas 
+
+} );
+renderer.setPixelRatio( window.devicePixelRatio );
+renderer.setSize( window.innerWidth, window.innerHeight );
+document.body.appendChild( renderer.domElement );
+await renderer.init();
+
+// 2. 初始化場景
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera( 75, window.innerWidth / window.innerHeight, 0.1, 1000 );
+camera.position.z = 5;
+
+const geometry = new THREE.BoxGeometry( 1, 1, 1 );
+const material = new THREE.MeshBasicMaterial( { color: 0x00ff00 } );
+const cube = new THREE.Mesh( geometry, material );
+scene.add( cube );
+
+// 3. 設定 Post-Processing Pipeline
+const postProcessing = new THREE.PostProcessing( renderer );
+
+// 建立場景節點 (渲染原始場景)
+const scenePass = pass( scene, camera );
+
+// 疊加效果節點 (TSL 節點)
+const dotScreenPass = dotScreen( scenePass );
+const rgbShiftPass = rgbShift( dotScreenPass );
+
+// 將最後的效果指定給 outputNode
+//postProcessing.outputNode = rgbShiftPass;
+postProcessing.outputNode= scenePass;
+
+// 4. 動畫迴圈
+function animate( time ) {
+    cube.rotation.x = time / 2000;
+    cube.rotation.y = time / 1000;
+
+    // 使用 postProcessing 進行渲染，而不是 renderer.render
+    postProcessing.render();
+}
+
+//renderer.setAnimationLoop( animate );
+postProcessing.render();
